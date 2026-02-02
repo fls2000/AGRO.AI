@@ -1,0 +1,8 @@
+{
+  "name": "AgroVision OS - Precision Agriculture Interface",
+  "description": "A high-performance precision agriculture dashboard for tractors and machinery, featuring path optimization, real-time telemetry simulation, and AI-driven field analysis.",
+  "requestFramePermissions": [
+    "geolocation",
+    "microphone"
+  ]
+}
