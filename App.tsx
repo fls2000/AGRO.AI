@@ -14,11 +14,13 @@ const TAB_STORAGE_KEY = 'agrovision_active_tab';
 const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
 
-// --- Manual Base64 Encoding & Decoding for Gemini Live API ---
-// These functions are implemented manually to avoid external dependencies like js-base64 
-// and to comply strictly with the @google/genai guidelines for raw data streaming.
-function decodeBase64(base64: string) {
-  const binaryString = atob(base64);
+/**
+ * MANUAL BASE64 IMPLEMENTATION
+ * Following strictly the @google/genai Coding Guidelines for raw audio streaming.
+ * Avoids any external dependencies like 'js-base64'.
+ */
+function decode(base64: string): Uint8Array {
+  const binaryString = window.atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
@@ -27,15 +29,19 @@ function decodeBase64(base64: string) {
   return bytes;
 }
 
-function encodeBase64(bytes: Uint8Array) {
+function encode(bytes: Uint8Array): string {
   let binary = '';
   const len = bytes.byteLength;
   for (let i = 0; i < len; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary);
+  return window.btoa(binary);
 }
 
+/**
+ * Decodes raw PCM audio data into an AudioBuffer.
+ * This is used for gapless playback of model responses.
+ */
 async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext,
@@ -45,6 +51,7 @@ async function decodeAudioData(
   const dataInt16 = new Int16Array(data.buffer);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
     for (let i = 0; i < frameCount; i++) {
@@ -64,7 +71,6 @@ const App: React.FC = () => {
   const [isWorking, setIsWorking] = useState(false);
   const [loadingAI, setLoadingAI] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
-  const [isEditingField, setIsEditingField] = useState(false);
   const [isAutoSaving, setIsAutoSaving] = useState(false);
   const [autoApplyAI, setAutoApplyAI] = useState(() => localStorage.getItem(AUTO_APPLY_AI_KEY) !== 'false');
   const [autoApplySpacingAI, setAutoApplySpacingAI] = useState(() => localStorage.getItem(AUTO_APPLY_SPACING_KEY) !== 'false');
@@ -217,7 +223,7 @@ const App: React.FC = () => {
       const callbacks = {
         onopen: () => {
           setIsLiveActive(true);
-          // Stream audio from microphone to model using manual base64 encoding
+          // Stream audio from microphone using manual `encode` function
           const source = audioContextInRef.current!.createMediaStreamSource(stream);
           const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
           scriptProcessor.onaudioprocess = (e) => {
@@ -226,7 +232,7 @@ const App: React.FC = () => {
             const int16 = new Int16Array(l);
             for (let i = 0; i < l; i++) int16[i] = inputData[i] * 32768;
             const pcmBlob = {
-              data: encodeBase64(new Uint8Array(int16.buffer)),
+              data: encode(new Uint8Array(int16.buffer)),
               mimeType: 'audio/pcm;rate=16000',
             };
             liveSessionPromiseRef.current?.then(session => session.sendRealtimeInput({ media: pcmBlob }));
@@ -246,7 +252,8 @@ const App: React.FC = () => {
           if (audioData && audioContextOutRef.current) {
             const ctx = audioContextOutRef.current;
             nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-            const audioBuffer = await decodeAudioData(decodeBase64(audioData), ctx, 24000, 1);
+            // Decode PCM using manual `decode` helper
+            const audioBuffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
             const source = ctx.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(ctx.destination);
@@ -306,7 +313,7 @@ const App: React.FC = () => {
           <div className="flex flex-col">
             <div className="flex items-center gap-3">
               <h1 className="text-3xl font-black tracking-tighter text-white drop-shadow-lg">{boundary.farmName ? `${boundary.farmName} - ` : ''}{boundary.name}</h1>
-              <button onClick={() => setIsEditingField(true)} className="p-2 bg-zinc-800 hover:bg-blue-600 text-zinc-400 hover:text-white rounded-lg transition-all shadow-md"><Edit3 size={16} /></button>
+              <button className="p-2 bg-zinc-800 hover:bg-blue-600 text-zinc-400 hover:text-white rounded-lg transition-all shadow-md"><Edit3 size={16} /></button>
             </div>
             <div className="flex items-center gap-2 mt-1">
               <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-widest ${isWorking ? 'bg-green-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}>{isWorking ? 'Em Operação' : 'Standby'}</span>
@@ -356,7 +363,7 @@ const App: React.FC = () => {
                   <div className="p-2 bg-blue-600 rounded-lg text-white shadow-lg"><MessageSquare size={20} /></div>
                   <div className="flex-1 max-h-24 overflow-y-auto text-xs font-medium text-zinc-300 custom-scrollbar">
                     {liveTranscript.map((t, i) => <p key={i} className={`mb-1 last:mb-0 ${i === liveTranscript.length - 1 ? 'text-white font-bold' : 'opacity-60'}`}>{t}</p>)}
-                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">Assistente AgroVision online...</p>}
+                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">Assistente AgroVision pronto para instrução vocal...</p>}
                   </div>
                 </div>
               )}
@@ -437,7 +444,7 @@ const App: React.FC = () => {
       <footer className="absolute bottom-0 left-20 right-0 h-10 bg-black/90 border-t border-zinc-800/50 flex items-center px-6 justify-between text-[9px] font-black text-zinc-600 uppercase tracking-[0.2em] z-20">
         <div className="flex gap-8">
           <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-green-500"></div> ISOBUS: ONLINE</span>
-          <span className="text-zinc-500">AGROVISION OS v2.4.0-PRO</span>
+          <span className="text-zinc-500">AGROVISION OS v2.4.0-PRO • NATIVE GENAI STREAMING</span>
         </div>
       </footer>
     </div>
