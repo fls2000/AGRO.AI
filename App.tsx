@@ -14,7 +14,9 @@ const TAB_STORAGE_KEY = 'agrovision_active_tab';
 const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
 
-// --- Manual Base64 Helpers for Live API (as per guidelines) ---
+// --- Manual Base64 Encoding & Decoding for Gemini Live API ---
+// These functions are implemented manually to avoid external dependencies like js-base64 
+// and to comply strictly with the @google/genai guidelines for raw data streaming.
 function decodeBase64(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -215,7 +217,7 @@ const App: React.FC = () => {
       const callbacks = {
         onopen: () => {
           setIsLiveActive(true);
-          // Stream audio from microphone to model
+          // Stream audio from microphone to model using manual base64 encoding
           const source = audioContextInRef.current!.createMediaStreamSource(stream);
           const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
           scriptProcessor.onaudioprocess = (e) => {
