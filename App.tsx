@@ -15,12 +15,13 @@ const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
 
 /**
- * MANUAL BASE64 IMPLEMENTATION
- * Following strictly the @google/genai Coding Guidelines for raw audio streaming.
- * Avoids any external dependencies like 'js-base64'.
+ * BASE64 ENCODING & DECODING (MANUAL IMPLEMENTATION)
+ * These utilities use native window.atob and window.btoa for cross-browser compatibility
+ * and perform manual byte-to-string conversion required for raw PCM audio streaming 
+ * with the Gemini Live API, as per @google/genai guidelines.
  */
 function decode(base64: string): Uint8Array {
-  const binaryString = window.atob(base64);
+  const binaryString = atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
@@ -35,12 +36,11 @@ function encode(bytes: Uint8Array): string {
   for (let i = 0; i < len; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return window.btoa(binary);
+  return btoa(binary);
 }
 
 /**
- * Decodes raw PCM audio data into an AudioBuffer.
- * This is used for gapless playback of model responses.
+ * Decodes raw PCM audio data into an AudioBuffer for gapless playback.
  */
 async function decodeAudioData(
   data: Uint8Array,
@@ -223,7 +223,6 @@ const App: React.FC = () => {
       const callbacks = {
         onopen: () => {
           setIsLiveActive(true);
-          // Stream audio from microphone using manual `encode` function
           const source = audioContextInRef.current!.createMediaStreamSource(stream);
           const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
           scriptProcessor.onaudioprocess = (e) => {
@@ -252,7 +251,6 @@ const App: React.FC = () => {
           if (audioData && audioContextOutRef.current) {
             const ctx = audioContextOutRef.current;
             nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-            // Decode PCM using manual `decode` helper
             const audioBuffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
             const source = ctx.createBufferSource();
             source.buffer = audioBuffer;
