@@ -14,7 +14,7 @@ const TAB_STORAGE_KEY = 'agrovision_active_tab';
 const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
 
-// --- Audio Helpers for Live API ---
+// --- Manual Base64 Helpers for Live API (as per guidelines) ---
 function decodeBase64(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -23,6 +23,15 @@ function decodeBase64(base64: string) {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return bytes;
+}
+
+function encodeBase64(bytes: Uint8Array) {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
 async function decodeAudioData(
@@ -58,28 +67,23 @@ const App: React.FC = () => {
   const [autoApplyAI, setAutoApplyAI] = useState(() => localStorage.getItem(AUTO_APPLY_AI_KEY) !== 'false');
   const [autoApplySpacingAI, setAutoApplySpacingAI] = useState(() => localStorage.getItem(AUTO_APPLY_SPACING_KEY) !== 'false');
   
-  // Save Field State
   const [isSavingField, setIsSavingField] = useState(false);
   const [newFieldName, setNewFieldName] = useState('');
   const [newFarmName, setNewFarmName] = useState('');
-  
-  // Search Maps State
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<{ text: string, sources: any[] } | null>(null);
   const [isSearching, setIsSearching] = useState(false);
 
-  // Live API State
+  // --- Live API Management ---
   const [isLiveActive, setIsLiveActive] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState<string[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const liveSessionRef = useRef<any>(null);
+  const liveSessionPromiseRef = useRef<Promise<any> | null>(null);
+  const audioContextInRef = useRef<AudioContext | null>(null);
+  const audioContextOutRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef(0);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
-  const [saveName, setSaveName] = useState('');
   const [fieldSearchQuery, setFieldSearchQuery] = useState('');
-  const [lineSearchQuery, setLineSearchQuery] = useState('');
-  const [savedLines, setSavedLines] = useState<SavedABLine[]>([]);
   const [savedFields, setSavedFields] = useState<SavedFieldBoundary[]>([]);
   const [visibleFieldIds, setVisibleFieldIds] = useState<Set<string>>(new Set());
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -99,9 +103,6 @@ const App: React.FC = () => {
     };
   });
 
-  const [editFarmName, setEditFarmName] = useState(boundary.farmName || '');
-  const [editFieldName, setEditFieldName] = useState(boundary.name);
-
   const [abLine, setAbLine] = useState<ABLine | null>(() => {
     const saved = localStorage.getItem(SESSION_CONFIG_KEY);
     try { if (saved) return JSON.parse(saved).abLine; } catch(e) {}
@@ -111,7 +112,6 @@ const App: React.FC = () => {
   const [machineWidth] = useState(12);
   const [tractorPos, setTractorPos] = useState<Point>({ x: 0, y: 0 });
   const [optimization, setOptimization] = useState<PathOptimizationResult | null>(null);
-  const [hasAppliedOptimization, setHasAppliedOptimization] = useState(false);
 
   const pushToHistory = useCallback(() => {
     setPast(prev => [...prev.slice(-49), { boundary: { ...boundary }, abLine: abLine ? { ...abLine } : null }]);
@@ -140,18 +140,10 @@ const App: React.FC = () => {
     const sync = () => setIsOnline(navigator.onLine);
     window.addEventListener('online', sync);
     window.addEventListener('offline', sync);
-    const lines = localStorage.getItem(STORAGE_KEY);
     const fields = localStorage.getItem(SAVED_FIELDS_KEY);
-    if (lines) setSavedLines(JSON.parse(lines));
     if (fields) setSavedFields(JSON.parse(fields));
     return () => { window.removeEventListener('online', sync); window.removeEventListener('offline', sync); };
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem(TAB_STORAGE_KEY, activeTab);
-    localStorage.setItem(AUTO_APPLY_AI_KEY, autoApplyAI.toString());
-    localStorage.setItem(AUTO_APPLY_SPACING_KEY, autoApplySpacingAI.toString());
-  }, [activeTab, autoApplyAI, autoApplySpacingAI]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -179,16 +171,9 @@ const App: React.FC = () => {
     setVisibleFieldIds(next);
   };
 
-  const handleOpenSaveFieldModal = () => {
-    setNewFieldName(boundary.name || '');
-    setNewFarmName(boundary.farmName || '');
-    setValidationError(null);
-    setIsSavingField(true);
-  };
-
   const handleSaveFieldAction = () => {
     if (!newFieldName.trim() || !newFarmName.trim()) {
-      setValidationError("O nome do talhão e da fazenda são obrigatórios.");
+      setValidationError("Nome e Fazenda são obrigatórios.");
       return;
     }
     const newField: SavedFieldBoundary = {
@@ -201,15 +186,8 @@ const App: React.FC = () => {
     const updated = [newField, ...savedFields];
     setSavedFields(updated);
     localStorage.setItem(SAVED_FIELDS_KEY, JSON.stringify(updated));
-    
-    // Update active boundary for consistency
     setBoundary(newField);
-    setEditFieldName(newField.name);
-    setEditFarmName(newField.farmName || '');
-    
     setIsSavingField(false);
-    setNewFieldName('');
-    setNewFarmName('');
   };
 
   const handleSearchMaps = async () => {
@@ -224,26 +202,47 @@ const App: React.FC = () => {
 
   const toggleLiveAssistant = async () => {
     if (isLiveActive) {
-      liveSessionRef.current?.close();
+      liveSessionPromiseRef.current?.then(s => s.close());
       setIsLiveActive(false);
       return;
     }
 
     try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContextInRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextOutRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
       const callbacks = {
-        onopen: () => setIsLiveActive(true),
+        onopen: () => {
+          setIsLiveActive(true);
+          // Stream audio from microphone to model
+          const source = audioContextInRef.current!.createMediaStreamSource(stream);
+          const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
+          scriptProcessor.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer.getChannelData(0);
+            const l = inputData.length;
+            const int16 = new Int16Array(l);
+            for (let i = 0; i < l; i++) int16[i] = inputData[i] * 32768;
+            const pcmBlob = {
+              data: encodeBase64(new Uint8Array(int16.buffer)),
+              mimeType: 'audio/pcm;rate=16000',
+            };
+            liveSessionPromiseRef.current?.then(session => session.sendRealtimeInput({ media: pcmBlob }));
+          };
+          source.connect(scriptProcessor);
+          scriptProcessor.connect(audioContextInRef.current!.destination);
+        },
         onmessage: async (msg: any) => {
           if (msg.serverContent?.outputTranscription) {
-            setLiveTranscript(prev => [...prev.slice(-10), `AI: ${msg.serverContent.outputTranscription.text}`]);
+            setLiveTranscript(prev => [...prev.slice(-4), `AgroVision: ${msg.serverContent.outputTranscription.text}`]);
           }
-          
+          if (msg.serverContent?.inputTranscription) {
+            setLiveTranscript(prev => [...prev.slice(-4), `Operador: ${msg.serverContent.inputTranscription.text}`]);
+          }
+
           const audioData = msg.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-          if (audioData && audioContextRef.current) {
-            const ctx = audioContextRef.current;
+          if (audioData && audioContextOutRef.current) {
+            const ctx = audioContextOutRef.current;
             nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
             const audioBuffer = await decodeAudioData(decodeBase64(audioData), ctx, 24000, 1);
             const source = ctx.createBufferSource();
@@ -261,15 +260,11 @@ const App: React.FC = () => {
             nextStartTimeRef.current = 0;
           }
         },
-        onclose: () => {
-          setIsLiveActive(false);
-          audioSourcesRef.current.forEach(s => s.stop());
-          audioSourcesRef.current.clear();
-        },
-        onerror: (e: any) => console.error("Live API Error", e),
+        onclose: () => setIsLiveActive(false),
+        onerror: (e: any) => console.error("Live Error", e),
       };
 
-      liveSessionRef.current = await connectLiveAssistant(callbacks);
+      liveSessionPromiseRef.current = Promise.resolve(connectLiveAssistant(callbacks));
     } catch (e) {
       console.error("Failed to start Live API", e);
     }
@@ -285,9 +280,8 @@ const App: React.FC = () => {
       if (autoApplyAI && abLine) {
         pushToHistory();
         setAbLine({ ...abLine, heading: res.suggestedHeading, spacing: (autoApplySpacingAI && res.suggestedSpacing) ? res.suggestedSpacing : abLine.spacing });
-        setHasAppliedOptimization(true);
       }
-    } catch (e) { setValidationError("Falha na análise de IA."); }
+    } catch (e) { setValidationError("Falha na análise."); }
     setLoadingAI(false);
   };
 
@@ -318,7 +312,7 @@ const App: React.FC = () => {
             </div>
           </div>
           <div className="flex gap-4">
-            <button onClick={handleOpenSaveFieldModal} className="group flex items-center gap-2 px-6 py-4 bg-zinc-900 border border-zinc-800 rounded-xl font-black text-sm hover:bg-zinc-800 transition-all text-white shadow-xl">
+            <button onClick={() => setIsSavingField(true)} className="group flex items-center gap-2 px-6 py-4 bg-zinc-900 border border-zinc-800 rounded-xl font-black text-sm hover:bg-zinc-800 transition-all text-white shadow-xl">
               <Save size={18} className="text-blue-400 group-hover:scale-110 transition-transform" /> SALVAR TALHÃO
             </button>
             <button onClick={() => setIsWorking(!isWorking)} className={`flex items-center gap-3 px-10 py-4 rounded-xl font-black transition-all shadow-2xl active:scale-95 border-b-4 ${isWorking ? 'bg-red-600 hover:bg-red-700 border-red-800' : 'bg-green-600 hover:bg-green-700 border-green-800'} text-white`}>
@@ -334,32 +328,17 @@ const App: React.FC = () => {
               <div className="flex justify-between items-center mb-6">
                 <div>
                   <h2 className="text-xl font-black uppercase text-white tracking-tighter">Biblioteca AgroVision</h2>
-                  <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mt-1">Exportar talhão para armazenamento seguro</p>
+                  <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mt-1">Armazenar talhão atual</p>
                 </div>
                 <button onClick={() => setIsSavingField(false)} className="p-2 hover:bg-zinc-800 rounded-full transition-colors text-zinc-500"><X size={20} /></button>
               </div>
-              
               <div className="space-y-6">
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Identificação do Talhão</label>
-                  <input type="text" placeholder="Ex: Talhão Leste 12" value={newFieldName} onChange={e => { setNewFieldName(e.target.value); if(validationError) setValidationError(null); }} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
-                </div>
-                
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Fazenda Associada</label>
-                  <input type="text" placeholder="Ex: Fazenda Santa Cruz" value={newFarmName} onChange={e => { setNewFarmName(e.target.value); if(validationError) setValidationError(null); }} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
-                </div>
-
-                {validationError && (
-                  <div className="flex items-center gap-2 p-3 bg-red-900/20 border border-red-800/30 rounded-lg">
-                    <AlertTriangle size={14} className="text-red-500" />
-                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-tight">{validationError}</p>
-                  </div>
-                )}
-
+                <input type="text" placeholder="Nome do Talhão" value={newFieldName} onChange={e => setNewFieldName(e.target.value)} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
+                <input type="text" placeholder="Fazenda" value={newFarmName} onChange={e => setNewFarmName(e.target.value)} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
+                {validationError && <p className="text-[10px] text-red-500 font-bold uppercase">{validationError}</p>}
                 <div className="flex gap-4 pt-4">
-                  <button onClick={() => setIsSavingField(false)} className="flex-1 py-4 text-zinc-500 font-black uppercase text-xs tracking-widest hover:text-zinc-300">Cancelar</button>
-                  <button onClick={handleSaveFieldAction} className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black uppercase text-xs tracking-widest shadow-lg shadow-blue-900/20 transition-all flex items-center justify-center gap-2"><CheckCircle2 size={16} />Confirmar</button>
+                  <button onClick={() => setIsSavingField(false)} className="flex-1 py-4 text-zinc-500 font-black uppercase text-xs tracking-widest">Cancelar</button>
+                  <button onClick={handleSaveFieldAction} className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black uppercase text-xs tracking-widest shadow-lg flex items-center justify-center gap-2"><CheckCircle2 size={16} />Confirmar</button>
                 </div>
               </div>
             </div>
@@ -374,8 +353,8 @@ const App: React.FC = () => {
                 <div className="absolute bottom-4 left-4 right-4 bg-black/60 backdrop-blur-md p-4 rounded-xl border border-zinc-800 flex items-start gap-4 animate-in slide-in-from-bottom-4 duration-300 shadow-2xl">
                   <div className="p-2 bg-blue-600 rounded-lg text-white shadow-lg"><MessageSquare size={20} /></div>
                   <div className="flex-1 max-h-24 overflow-y-auto text-xs font-medium text-zinc-300 custom-scrollbar">
-                    {liveTranscript.slice(-4).map((t, i) => <p key={i} className={`mb-1 last:mb-0 ${i === liveTranscript.length - 1 ? 'text-white font-bold' : 'opacity-60'}`}>{t}</p>)}
-                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">AgroVision Voice Assistant está online...</p>}
+                    {liveTranscript.map((t, i) => <p key={i} className={`mb-1 last:mb-0 ${i === liveTranscript.length - 1 ? 'text-white font-bold' : 'opacity-60'}`}>{t}</p>)}
+                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">Assistente AgroVision online...</p>}
                   </div>
                 </div>
               )}
@@ -385,9 +364,9 @@ const App: React.FC = () => {
 
           <div className="flex-[1] flex flex-col gap-4 min-w-[340px] overflow-y-auto pr-2 custom-scrollbar pb-8">
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md shadow-lg">
-              <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2 mb-4"><MapPin size={14} className="text-red-500" /> Agro-Serviços (Maps)</h3>
+              <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2 mb-4"><MapPin size={14} className="text-red-500" /> Agro-Serviços</h3>
               <div className="flex gap-2 mb-4">
-                <input type="text" placeholder="Pesquisar Silos, Peças, Oficinas..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSearchMaps()} className="flex-1 bg-black/40 border border-zinc-800 rounded-lg px-3 py-2 text-xs outline-none focus:border-red-600 transition-colors font-medium" />
+                <input type="text" placeholder="Localizar silos, peças..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="flex-1 bg-black/40 border border-zinc-800 rounded-lg px-3 py-2 text-xs outline-none focus:border-red-600 transition-colors font-medium" />
                 <button onClick={handleSearchMaps} disabled={isSearching} className="p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700 transition-colors text-white">
                   {isSearching ? <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin"></div> : <Search size={16} />}
                 </button>
@@ -397,16 +376,11 @@ const App: React.FC = () => {
                   <div className="p-3 bg-black/40 rounded-lg border border-zinc-800/50">
                     <p className="font-medium whitespace-pre-wrap leading-relaxed">{searchResults.text}</p>
                   </div>
-                  {searchResults.sources.length > 0 && (
-                    <div className="flex flex-col gap-2">
-                      <p className="text-[8px] font-black uppercase text-zinc-600 tracking-widest">Localizações:</p>
-                      {searchResults.sources.map((s: any, i: number) => s.maps && (
-                        <a key={i} href={s.maps.uri} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 transition-colors flex items-center gap-1.5 p-1.5 hover:bg-blue-500/5 border border-transparent hover:border-blue-500/20 rounded truncate">
-                          <MapPin size={10} /> {s.maps.title}
-                        </a>
-                      ))}
-                    </div>
-                  )}
+                  {searchResults.sources.map((s: any, i: number) => s.maps && (
+                    <a key={i} href={s.maps.uri} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 transition-colors flex items-center gap-1.5 truncate">
+                      <MapPin size={10} /> {s.maps.title}
+                    </a>
+                  ))}
                 </div>
               )}
             </section>
@@ -418,30 +392,12 @@ const App: React.FC = () => {
 
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md flex flex-col gap-4 shadow-lg">
               <div className="flex items-center justify-between">
-                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><MapPinned size={14} className="text-orange-500" /> Biblioteca de Talhões</h3>
-                <div className="text-[9px] font-bold text-zinc-600 uppercase tracking-widest">{savedFields.length + 1} Salvos</div>
+                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><MapPinned size={14} className="text-orange-500" /> Talhões Salvos</h3>
               </div>
-              
-              <div className="relative">
-                 <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600" />
-                 <input type="text" value={fieldSearchQuery} onChange={(e) => setFieldSearchQuery(e.target.value)} placeholder="Localizar talhão..." className="w-full bg-black/40 border border-zinc-800 rounded-lg py-2 pl-9 pr-3 text-[10px] outline-none focus:border-orange-600 transition-colors font-black uppercase" />
-              </div>
-
               <div className="flex flex-col gap-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
-                <div className="flex items-center justify-between p-3 rounded-xl border bg-orange-500/10 border-orange-500/50 shadow-lg">
-                   <div className="flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[10px] font-black uppercase tracking-wider text-orange-400">SESSION ACTIVE</span>
-                        <div className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse"></div>
-                      </div>
-                      <span className="text-[9px] font-bold text-zinc-300 uppercase block mt-0.5">{boundary.name} • {boundary.areaHectares} HA</span>
-                   </div>
-                   <CheckCircle2 size={14} className="text-orange-500" />
-                </div>
-
-                {savedFields.filter(f => f.name.toLowerCase().includes(fieldSearchQuery.toLowerCase()) || f.farmName?.toLowerCase().includes(fieldSearchQuery.toLowerCase())).map(f => boundary.id !== f.id && (
-                  <div key={f.id} className="flex items-center justify-between p-2.5 rounded-xl border bg-black/30 border-zinc-800/50 hover:border-zinc-700 transition-all group">
-                    <div className="flex-1 cursor-pointer" onClick={() => { pushToHistory(); setBoundary(f); setEditFieldName(f.name); setEditFarmName(f.farmName || ''); }}>
+                {savedFields.map(f => (
+                  <div key={f.id} className="flex items-center justify-between p-2.5 rounded-xl border bg-black/30 border-zinc-800/50 group">
+                    <div className="flex-1 cursor-pointer" onClick={() => { pushToHistory(); setBoundary(f); }}>
                       <span className="text-[10px] font-black uppercase tracking-wider block truncate text-zinc-400 group-hover:text-white transition-colors">{f.name}</span>
                       <span className="text-[9px] font-bold text-zinc-600 uppercase">{f.farmName} • {f.areaHectares} HA</span>
                     </div>
@@ -455,10 +411,10 @@ const App: React.FC = () => {
 
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md shadow-lg">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><Cpu size={14} className="text-green-500" /> IA Precision Optimization</h3>
+                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><Cpu size={14} className="text-green-500" /> IA Otimização</h3>
               </div>
               {!optimization ? (
-                <button disabled={loadingAI} onClick={handleOptimize} className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-white rounded-xl font-black border border-zinc-700 transition-all flex items-center justify-center gap-3 active:scale-95">
+                <button disabled={loadingAI} onClick={handleOptimize} className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-white rounded-xl font-black border border-zinc-700 transition-all flex items-center justify-center gap-3">
                   {loadingAI ? <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin"></div> : <Globe size={16} className="text-green-500" />}
                   <span>ANALISAR OTIMIZAÇÃO</span>
                 </button>
@@ -466,13 +422,9 @@ const App: React.FC = () => {
                 <div className="space-y-4 animate-in fade-in slide-in-from-right-2 duration-500">
                   <div className="grid grid-cols-2 gap-3 text-center">
                     <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50"><p className="text-[9px] text-zinc-500 font-black">EFICIÊNCIA</p><p className="text-xl font-bold text-green-500 font-mono">{(optimization.efficiency * 100).toFixed(0)}%</p></div>
-                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50"><p className="text-[9px] text-zinc-500 font-black">SUGERIDO</p><p className="text-xs font-bold text-blue-500 font-mono">{optimization.suggestedHeading.toFixed(1)}° | {optimization.suggestedSpacing}m</p></div>
+                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50"><p className="text-[9px] text-zinc-500 font-black">SUGERIDO</p><p className="text-xs font-bold text-blue-500 font-mono">{optimization.suggestedHeading.toFixed(1)}°</p></div>
                   </div>
-                  <div className="p-3 bg-green-500/5 border border-green-500/20 rounded-xl relative overflow-hidden">
-                    <div className="absolute top-0 right-0 p-1 opacity-20"><Sparkles size={12} className="text-green-500" /></div>
-                    <p className="text-[10px] text-zinc-400 font-medium italic leading-relaxed">"{optimization.recommendations}"</p>
-                  </div>
-                  <button onClick={() => setOptimization(null)} className="w-full text-[10px] font-black text-zinc-600 uppercase hover:text-zinc-400 transition-colors tracking-widest py-1">Nova Análise</button>
+                  <p className="text-[10px] text-zinc-400 font-medium italic leading-relaxed">"{optimization.recommendations}"</p>
                 </div>
               )}
             </section>
@@ -482,10 +434,9 @@ const App: React.FC = () => {
 
       <footer className="absolute bottom-0 left-20 right-0 h-10 bg-black/90 border-t border-zinc-800/50 flex items-center px-6 justify-between text-[9px] font-black text-zinc-600 uppercase tracking-[0.2em] z-20">
         <div className="flex gap-8">
-          <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.6)]"></div> ISOBUS SYSTEM: ONLINE</span>
-          <span className={`flex items-center gap-2 transition-all duration-700 ${isAutoSaving ? 'text-blue-400 opacity-100' : 'text-zinc-800 opacity-50'}`}><CloudUpload size={12} className={isAutoSaving ? 'animate-bounce' : ''} /> {isAutoSaving ? 'SINC. EM NUVEM...' : 'ESTADO SINCRONIZADO'}</span>
+          <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-green-500"></div> ISOBUS: ONLINE</span>
+          <span className="text-zinc-500">AGROVISION OS v2.4.0-PRO</span>
         </div>
-        <div className="flex items-center gap-4"><span className="text-zinc-400 font-bold">AGROVISION OS v2.4.0-PRO</span></div>
       </footer>
     </div>
   );
