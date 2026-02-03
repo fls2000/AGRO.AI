@@ -11,9 +11,37 @@ const SAVED_FIELDS_KEY = 'agrovision_saved_fields';
 const BOUNDARY_STORAGE_KEY = 'agrovision_active_boundary';
 const SESSION_CONFIG_KEY = 'agrovision_active_session_config';
 const TAB_STORAGE_KEY = 'agrovision_active_tab';
-const SPEED_STORAGE_KEY = 'agrovision_sim_speed';
 const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
+
+// --- Audio Helpers for Live API ---
+function decodeBase64(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
 
 interface HistoryState {
   boundary: FieldBoundary;
@@ -45,6 +73,8 @@ const App: React.FC = () => {
   const [liveTranscript, setLiveTranscript] = useState<string[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const liveSessionRef = useRef<any>(null);
+  const nextStartTimeRef = useRef(0);
+  const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
   const [saveName, setSaveName] = useState('');
   const [fieldSearchQuery, setFieldSearchQuery] = useState('');
@@ -53,7 +83,6 @@ const App: React.FC = () => {
   const [savedFields, setSavedFields] = useState<SavedFieldBoundary[]>([]);
   const [visibleFieldIds, setVisibleFieldIds] = useState<Set<string>>(new Set());
   const [validationError, setValidationError] = useState<string | null>(null);
-  const [fieldModalError, setFieldModalError] = useState<string | null>(null);
   const [past, setPast] = useState<HistoryState[]>([]);
   const [future, setFuture] = useState<HistoryState[]>([]);
   
@@ -173,7 +202,7 @@ const App: React.FC = () => {
     setSavedFields(updated);
     localStorage.setItem(SAVED_FIELDS_KEY, JSON.stringify(updated));
     
-    // Also update active boundary to match the saved one (consistency)
+    // Update active boundary for consistency
     setBoundary(newField);
     setEditFieldName(newField.name);
     setEditFarmName(newField.farmName || '');
@@ -187,11 +216,9 @@ const App: React.FC = () => {
     if (!searchQuery.trim()) return;
     setIsSearching(true);
     try {
-      const res = await findNearbyAgroServices(-23.5505, -46.6333, searchQuery); // Mocked center coordinate
+      const res = await findNearbyAgroServices(-23.5505, -46.6333, searchQuery); 
       setSearchResults(res);
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
     setIsSearching(false);
   };
 
@@ -203,22 +230,43 @@ const App: React.FC = () => {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
       
       const callbacks = {
         onopen: () => setIsLiveActive(true),
         onmessage: async (msg: any) => {
           if (msg.serverContent?.outputTranscription) {
-            setLiveTranscript(prev => [...prev, `AI: ${msg.serverContent.outputTranscription.text}`]);
+            setLiveTranscript(prev => [...prev.slice(-10), `AI: ${msg.serverContent.outputTranscription.text}`]);
           }
+          
           const audioData = msg.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
           if (audioData && audioContextRef.current) {
-            // Decoding logic would go here
+            const ctx = audioContextRef.current;
+            nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+            const audioBuffer = await decodeAudioData(decodeBase64(audioData), ctx, 24000, 1);
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(ctx.destination);
+            source.addEventListener('ended', () => audioSourcesRef.current.delete(source));
+            source.start(nextStartTimeRef.current);
+            nextStartTimeRef.current += audioBuffer.duration;
+            audioSourcesRef.current.add(source);
+          }
+
+          if (msg.serverContent?.interrupted) {
+            audioSourcesRef.current.forEach(s => s.stop());
+            audioSourcesRef.current.clear();
+            nextStartTimeRef.current = 0;
           }
         },
-        onclose: () => setIsLiveActive(false),
-        onerror: (e: any) => console.error(e),
+        onclose: () => {
+          setIsLiveActive(false);
+          audioSourcesRef.current.forEach(s => s.stop());
+          audioSourcesRef.current.clear();
+        },
+        onerror: (e: any) => console.error("Live API Error", e),
       };
 
       liveSessionRef.current = await connectLiveAssistant(callbacks);
@@ -252,17 +300,17 @@ const App: React.FC = () => {
           <button onClick={() => setActiveTab('map')} className={`p-3 rounded-xl transition-all ${activeTab === 'map' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}><MapIcon size={24} /></button>
           <button onClick={() => setActiveTab('data')} className={`p-3 rounded-xl transition-all ${activeTab === 'data' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}><Database size={24} /></button>
         </div>
-        <button onClick={toggleLiveAssistant} className={`p-3 rounded-xl transition-all ${isLiveActive ? 'bg-blue-600 text-white animate-pulse' : 'text-zinc-500 hover:text-zinc-300'}`}>
+        <button onClick={toggleLiveAssistant} className={`p-3 rounded-xl transition-all shadow-lg ${isLiveActive ? 'bg-blue-600 text-white animate-pulse' : 'text-zinc-500 hover:text-zinc-300 bg-zinc-900'}`} title="Conversar com Assistente">
           {isLiveActive ? <Mic size={24} /> : <MicOff size={24} />}
         </button>
       </nav>
 
       <main className="flex-1 flex flex-col p-6 overflow-hidden relative">
         <header className="flex justify-between items-start mb-6 z-10">
-          <div>
+          <div className="flex flex-col">
             <div className="flex items-center gap-3">
-              <h1 className="text-3xl font-black tracking-tighter text-white">{boundary.farmName ? `${boundary.farmName} - ` : ''}{boundary.name}</h1>
-              <button onClick={() => setIsEditingField(true)} className="p-2 bg-zinc-800 hover:bg-blue-600 text-zinc-400 hover:text-white rounded-lg transition-all"><Edit3 size={16} /></button>
+              <h1 className="text-3xl font-black tracking-tighter text-white drop-shadow-lg">{boundary.farmName ? `${boundary.farmName} - ` : ''}{boundary.name}</h1>
+              <button onClick={() => setIsEditingField(true)} className="p-2 bg-zinc-800 hover:bg-blue-600 text-zinc-400 hover:text-white rounded-lg transition-all shadow-md"><Edit3 size={16} /></button>
             </div>
             <div className="flex items-center gap-2 mt-1">
               <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-widest ${isWorking ? 'bg-green-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}>{isWorking ? 'Em Operação' : 'Standby'}</span>
@@ -270,8 +318,8 @@ const App: React.FC = () => {
             </div>
           </div>
           <div className="flex gap-4">
-            <button onClick={handleOpenSaveFieldModal} className="flex items-center gap-2 px-6 py-4 bg-zinc-900 border border-zinc-800 rounded-xl font-black text-sm hover:bg-zinc-800 transition-all text-white shadow-lg">
-              <Save size={18} className="text-blue-400" /> SALVAR TALHÃO
+            <button onClick={handleOpenSaveFieldModal} className="group flex items-center gap-2 px-6 py-4 bg-zinc-900 border border-zinc-800 rounded-xl font-black text-sm hover:bg-zinc-800 transition-all text-white shadow-xl">
+              <Save size={18} className="text-blue-400 group-hover:scale-110 transition-transform" /> SALVAR TALHÃO
             </button>
             <button onClick={() => setIsWorking(!isWorking)} className={`flex items-center gap-3 px-10 py-4 rounded-xl font-black transition-all shadow-2xl active:scale-95 border-b-4 ${isWorking ? 'bg-red-600 hover:bg-red-700 border-red-800' : 'bg-green-600 hover:bg-green-700 border-green-800'} text-white`}>
               {isWorking ? <Square size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}
@@ -285,51 +333,33 @@ const App: React.FC = () => {
             <div className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-md p-8 shadow-2xl animate-in zoom-in-95 duration-200">
               <div className="flex justify-between items-center mb-6">
                 <div>
-                  <h2 className="text-xl font-black uppercase text-white tracking-tighter">Salvar na Biblioteca</h2>
-                  <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mt-1">Armazenar talhão atual para uso futuro</p>
+                  <h2 className="text-xl font-black uppercase text-white tracking-tighter">Biblioteca AgroVision</h2>
+                  <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mt-1">Exportar talhão para armazenamento seguro</p>
                 </div>
                 <button onClick={() => setIsSavingField(false)} className="p-2 hover:bg-zinc-800 rounded-full transition-colors text-zinc-500"><X size={20} /></button>
               </div>
               
               <div className="space-y-6">
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Nome do Talhão</label>
-                  <input 
-                    type="text" 
-                    placeholder="Ex: Talhão Sul 04" 
-                    value={newFieldName} 
-                    onChange={e => { setNewFieldName(e.target.value); if(validationError) setValidationError(null); }} 
-                    className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" 
-                  />
+                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Identificação do Talhão</label>
+                  <input type="text" placeholder="Ex: Talhão Leste 12" value={newFieldName} onChange={e => { setNewFieldName(e.target.value); if(validationError) setValidationError(null); }} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
                 </div>
                 
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Nome da Fazenda</label>
-                  <input 
-                    type="text" 
-                    placeholder="Ex: Fazenda Boa Esperança" 
-                    value={newFarmName} 
-                    onChange={e => { setNewFarmName(e.target.value); if(validationError) setValidationError(null); }} 
-                    className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" 
-                  />
+                  <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Fazenda Associada</label>
+                  <input type="text" placeholder="Ex: Fazenda Santa Cruz" value={newFarmName} onChange={e => { setNewFarmName(e.target.value); if(validationError) setValidationError(null); }} className="w-full bg-black border border-zinc-800 rounded-xl p-4 outline-none focus:border-blue-600 text-sm font-medium transition-all" />
                 </div>
 
                 {validationError && (
-                  <div className="flex items-center gap-2 p-3 bg-red-900/20 border border-red-800/30 rounded-lg animate-pulse">
+                  <div className="flex items-center gap-2 p-3 bg-red-900/20 border border-red-800/30 rounded-lg">
                     <AlertTriangle size={14} className="text-red-500" />
                     <p className="text-[10px] text-red-400 font-bold uppercase tracking-tight">{validationError}</p>
                   </div>
                 )}
 
                 <div className="flex gap-4 pt-4">
-                  <button onClick={() => setIsSavingField(false)} className="flex-1 py-4 text-zinc-500 font-black uppercase text-xs tracking-widest hover:text-zinc-300 transition-colors">Cancelar</button>
-                  <button 
-                    onClick={handleSaveFieldAction} 
-                    className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black uppercase text-xs tracking-widest shadow-lg shadow-blue-900/20 transition-all active:scale-95 flex items-center justify-center gap-2"
-                  >
-                    <CheckCircle2 size={16} />
-                    Confirmar Salvar
-                  </button>
+                  <button onClick={() => setIsSavingField(false)} className="flex-1 py-4 text-zinc-500 font-black uppercase text-xs tracking-widest hover:text-zinc-300">Cancelar</button>
+                  <button onClick={handleSaveFieldAction} className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black uppercase text-xs tracking-widest shadow-lg shadow-blue-900/20 transition-all flex items-center justify-center gap-2"><CheckCircle2 size={16} />Confirmar</button>
                 </div>
               </div>
             </div>
@@ -339,21 +369,13 @@ const App: React.FC = () => {
         <div className="flex-1 flex gap-6 min-h-0">
           <div className="flex-[3] flex flex-col gap-4">
             <div className="flex-1 relative">
-              <FieldCanvas 
-                boundaries={[boundary, ...savedFields]} 
-                activeBoundaryId={boundary.id} 
-                visibleBoundaryIds={visibleFieldIds} 
-                abLine={abLine} 
-                tractorPos={tractorPos} 
-                machineWidth={machineWidth} 
-                onHeadingChange={(h) => setAbLine(p => p ? { ...p, heading: h } : null)} 
-              />
+              <FieldCanvas boundaries={[boundary, ...savedFields]} activeBoundaryId={boundary.id} visibleBoundaryIds={visibleFieldIds} abLine={abLine} tractorPos={tractorPos} machineWidth={machineWidth} onHeadingChange={(h) => setAbLine(p => p ? { ...p, heading: h } : null)} />
               {isLiveActive && (
                 <div className="absolute bottom-4 left-4 right-4 bg-black/60 backdrop-blur-md p-4 rounded-xl border border-zinc-800 flex items-start gap-4 animate-in slide-in-from-bottom-4 duration-300 shadow-2xl">
-                  <div className="p-2 bg-blue-600 rounded-lg text-white"><MessageSquare size={20} /></div>
+                  <div className="p-2 bg-blue-600 rounded-lg text-white shadow-lg"><MessageSquare size={20} /></div>
                   <div className="flex-1 max-h-24 overflow-y-auto text-xs font-medium text-zinc-300 custom-scrollbar">
-                    {liveTranscript.slice(-3).map((t, i) => <p key={i} className="mb-1 last:mb-0 last:text-white font-bold">{t}</p>)}
-                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">AgroVision Assistant pronto para ouvir...</p>}
+                    {liveTranscript.slice(-4).map((t, i) => <p key={i} className={`mb-1 last:mb-0 ${i === liveTranscript.length - 1 ? 'text-white font-bold' : 'opacity-60'}`}>{t}</p>)}
+                    {liveTranscript.length === 0 && <p className="italic text-zinc-500 animate-pulse">AgroVision Voice Assistant está online...</p>}
                   </div>
                 </div>
               )}
@@ -361,13 +383,12 @@ const App: React.FC = () => {
             <TelemetryOverlay data={telemetry} />
           </div>
 
-          <div className="flex-[1] flex flex-col gap-4 min-w-[340px] overflow-y-auto pr-2 custom-scrollbar">
-            {/* Maps Grounding Section */}
+          <div className="flex-[1] flex flex-col gap-4 min-w-[340px] overflow-y-auto pr-2 custom-scrollbar pb-8">
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md shadow-lg">
-              <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2 mb-4"><MapPin size={14} className="text-red-500" /> Serviços Próximos</h3>
+              <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2 mb-4"><MapPin size={14} className="text-red-500" /> Agro-Serviços (Maps)</h3>
               <div className="flex gap-2 mb-4">
-                <input type="text" placeholder="Ex: Silos, Oficinas, Peças..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="flex-1 bg-black/40 border border-zinc-800 rounded-lg px-3 py-2 text-xs outline-none focus:border-red-600 transition-colors placeholder:text-zinc-700 font-medium" />
-                <button onClick={handleSearchMaps} disabled={isSearching} className="p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700 transition-colors text-white disabled:opacity-50">
+                <input type="text" placeholder="Pesquisar Silos, Peças, Oficinas..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSearchMaps()} className="flex-1 bg-black/40 border border-zinc-800 rounded-lg px-3 py-2 text-xs outline-none focus:border-red-600 transition-colors font-medium" />
+                <button onClick={handleSearchMaps} disabled={isSearching} className="p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700 transition-colors text-white">
                   {isSearching ? <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin"></div> : <Search size={16} />}
                 </button>
               </div>
@@ -378,9 +399,9 @@ const App: React.FC = () => {
                   </div>
                   {searchResults.sources.length > 0 && (
                     <div className="flex flex-col gap-2">
-                      <p className="text-[8px] font-black uppercase text-zinc-600 tracking-widest">Fontes Recomendadas:</p>
-                      {searchResults.sources.map((s: any, i: number) => (
-                        s.maps && <a key={i} href={s.maps.uri} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 transition-colors flex items-center gap-1.5 p-1 hover:bg-blue-500/5 rounded truncate">
+                      <p className="text-[8px] font-black uppercase text-zinc-600 tracking-widest">Localizações:</p>
+                      {searchResults.sources.map((s: any, i: number) => s.maps && (
+                        <a key={i} href={s.maps.uri} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 transition-colors flex items-center gap-1.5 p-1.5 hover:bg-blue-500/5 border border-transparent hover:border-blue-500/20 rounded truncate">
                           <MapPin size={10} /> {s.maps.title}
                         </a>
                       ))}
@@ -398,44 +419,35 @@ const App: React.FC = () => {
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md flex flex-col gap-4 shadow-lg">
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><MapPinned size={14} className="text-orange-500" /> Biblioteca de Talhões</h3>
-                <div className="text-[9px] font-bold text-zinc-600 uppercase tracking-widest">{savedFields.length + 1} Registrados</div>
+                <div className="text-[9px] font-bold text-zinc-600 uppercase tracking-widest">{savedFields.length + 1} Salvos</div>
               </div>
               
               <div className="relative">
                  <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600" />
-                 <input 
-                   type="text" 
-                   value={fieldSearchQuery} 
-                   onChange={(e) => setFieldSearchQuery(e.target.value)} 
-                   placeholder="Filtrar talhões..." 
-                   className="w-full bg-black/40 border border-zinc-800 rounded-lg py-2 pl-9 pr-3 text-[10px] outline-none focus:border-orange-600 transition-colors placeholder:text-zinc-700 uppercase font-black" 
-                 />
+                 <input type="text" value={fieldSearchQuery} onChange={(e) => setFieldSearchQuery(e.target.value)} placeholder="Localizar talhão..." className="w-full bg-black/40 border border-zinc-800 rounded-lg py-2 pl-9 pr-3 text-[10px] outline-none focus:border-orange-600 transition-colors font-black uppercase" />
               </div>
 
               <div className="flex flex-col gap-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
-                {/* Active Field Highlight */}
-                <div className="flex items-center justify-between p-2.5 rounded-xl border bg-orange-500/10 border-orange-500/50 shadow-[0_0_15px_rgba(249,115,22,0.1)]">
+                <div className="flex items-center justify-between p-3 rounded-xl border bg-orange-500/10 border-orange-500/50 shadow-lg">
                    <div className="flex-1">
                       <div className="flex items-center gap-1.5">
-                        <span className="text-[10px] font-black uppercase tracking-wider text-orange-400 truncate">SESSÃO ATUAL</span>
+                        <span className="text-[10px] font-black uppercase tracking-wider text-orange-400">SESSION ACTIVE</span>
                         <div className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse"></div>
                       </div>
-                      <span className="text-[9px] font-bold text-zinc-500 uppercase">{boundary.name} • {boundary.areaHectares} HA</span>
+                      <span className="text-[9px] font-bold text-zinc-300 uppercase block mt-0.5">{boundary.name} • {boundary.areaHectares} HA</span>
                    </div>
                    <CheckCircle2 size={14} className="text-orange-500" />
                 </div>
 
-                {savedFields.filter(f => f.name.toLowerCase().includes(fieldSearchQuery.toLowerCase()) || f.farmName?.toLowerCase().includes(fieldSearchQuery.toLowerCase())).map(f => (
-                  <div key={f.id} className={`flex items-center justify-between p-2.5 rounded-xl border transition-all ${boundary.id === f.id ? 'hidden' : 'bg-black/30 border-zinc-800/50 hover:border-zinc-700'}`}>
-                    <div className="flex-1 cursor-pointer group" onClick={() => { pushToHistory(); setBoundary(f); setEditFieldName(f.name); setEditFarmName(f.farmName || ''); }}>
-                      <span className="text-[10px] font-black uppercase tracking-wider block truncate text-zinc-300 group-hover:text-white transition-colors">{f.name}</span>
+                {savedFields.filter(f => f.name.toLowerCase().includes(fieldSearchQuery.toLowerCase()) || f.farmName?.toLowerCase().includes(fieldSearchQuery.toLowerCase())).map(f => boundary.id !== f.id && (
+                  <div key={f.id} className="flex items-center justify-between p-2.5 rounded-xl border bg-black/30 border-zinc-800/50 hover:border-zinc-700 transition-all group">
+                    <div className="flex-1 cursor-pointer" onClick={() => { pushToHistory(); setBoundary(f); setEditFieldName(f.name); setEditFarmName(f.farmName || ''); }}>
+                      <span className="text-[10px] font-black uppercase tracking-wider block truncate text-zinc-400 group-hover:text-white transition-colors">{f.name}</span>
                       <span className="text-[9px] font-bold text-zinc-600 uppercase">{f.farmName} • {f.areaHectares} HA</span>
                     </div>
-                    <div className="flex items-center gap-1">
-                      <button onClick={() => toggleFieldVisibility(f.id)} className={`p-1.5 transition-colors rounded ${visibleFieldIds.has(f.id) ? 'text-orange-500 bg-orange-500/10' : 'text-zinc-600 hover:text-zinc-400'}`}>
-                        {visibleFieldIds.has(f.id) ? <Eye size={14} /> : <EyeOff size={14} />}
-                      </button>
-                    </div>
+                    <button onClick={() => toggleFieldVisibility(f.id)} className={`p-1.5 transition-colors rounded ${visibleFieldIds.has(f.id) ? 'text-orange-500 bg-orange-500/10' : 'text-zinc-600 hover:text-zinc-400'}`}>
+                      {visibleFieldIds.has(f.id) ? <Eye size={14} /> : <EyeOff size={14} />}
+                    </button>
                   </div>
                 ))}
               </div>
@@ -443,17 +455,7 @@ const App: React.FC = () => {
 
             <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md shadow-lg">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><Cpu size={14} className="text-green-500" /> IA Precision Path</h3>
-                <div className="flex flex-col gap-1 items-end">
-                  <div className="flex items-center gap-2 cursor-pointer group" onClick={() => setAutoApplyAI(!autoApplyAI)}>
-                    <span className={`text-[8px] font-black uppercase transition-colors ${autoApplyAI ? 'text-blue-400' : 'text-zinc-600'}`}>Rumo Auto</span>
-                    {autoApplyAI ? <ToggleRight className="text-blue-500" size={18} /> : <ToggleLeft className="text-zinc-600" size={18} />}
-                  </div>
-                  <div className="flex items-center gap-2 cursor-pointer group" onClick={() => setAutoApplySpacingAI(!autoApplySpacingAI)}>
-                    <span className={`text-[8px] font-black uppercase transition-colors ${autoApplySpacingAI ? 'text-blue-400' : 'text-zinc-600'}`}>Espaç. Auto</span>
-                    {autoApplySpacingAI ? <ToggleRight className="text-blue-500" size={18} /> : <ToggleLeft className="text-zinc-600" size={18} />}
-                  </div>
-                </div>
+                <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><Cpu size={14} className="text-green-500" /> IA Precision Optimization</h3>
               </div>
               {!optimization ? (
                 <button disabled={loadingAI} onClick={handleOptimize} className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-white rounded-xl font-black border border-zinc-700 transition-all flex items-center justify-center gap-3 active:scale-95">
@@ -463,14 +465,8 @@ const App: React.FC = () => {
               ) : (
                 <div className="space-y-4 animate-in fade-in slide-in-from-right-2 duration-500">
                   <div className="grid grid-cols-2 gap-3 text-center">
-                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50">
-                      <p className="text-[9px] text-zinc-500 font-black tracking-widest">EFICIÊNCIA</p>
-                      <p className="text-xl font-bold text-green-500 font-mono">{(optimization.efficiency * 100).toFixed(0)}%</p>
-                    </div>
-                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50">
-                      <p className="text-[9px] text-zinc-500 font-black tracking-widest">SUGERIDO</p>
-                      <p className="text-xs font-bold text-blue-500 font-mono">{optimization.suggestedHeading.toFixed(1)}° | {optimization.suggestedSpacing}m</p>
-                    </div>
+                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50"><p className="text-[9px] text-zinc-500 font-black">EFICIÊNCIA</p><p className="text-xl font-bold text-green-500 font-mono">{(optimization.efficiency * 100).toFixed(0)}%</p></div>
+                    <div className="bg-black/40 p-2 rounded-xl border border-zinc-800/50"><p className="text-[9px] text-zinc-500 font-black">SUGERIDO</p><p className="text-xs font-bold text-blue-500 font-mono">{optimization.suggestedHeading.toFixed(1)}° | {optimization.suggestedSpacing}m</p></div>
                   </div>
                   <div className="p-3 bg-green-500/5 border border-green-500/20 rounded-xl relative overflow-hidden">
                     <div className="absolute top-0 right-0 p-1 opacity-20"><Sparkles size={12} className="text-green-500" /></div>
@@ -479,20 +475,6 @@ const App: React.FC = () => {
                   <button onClick={() => setOptimization(null)} className="w-full text-[10px] font-black text-zinc-600 uppercase hover:text-zinc-400 transition-colors tracking-widest py-1">Nova Análise</button>
                 </div>
               )}
-            </section>
-
-            <section className="bg-zinc-900/40 rounded-2xl p-6 border border-zinc-800/50 backdrop-blur-md flex flex-col gap-6 shadow-lg mb-8">
-              <h3 className="text-xs font-black text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2"><Gauge size={14} className="text-blue-500" /> Parâmetros Manuais</h3>
-              <div className="space-y-6">
-                <div>
-                  <div className="flex justify-between text-[10px] font-black text-zinc-500 uppercase mb-2 tracking-tighter"><span>Rumo da Linha AB</span><span className="text-blue-400 font-mono">{abLine?.heading.toFixed(1)}°</span></div>
-                  <input type="range" min="0" max="360" step="0.5" value={abLine?.heading || 0} onMouseDown={pushToHistory} onChange={(e) => setAbLine(p => p ? { ...p, heading: Number(e.target.value) } : null)} className="w-full h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-blue-600" />
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] font-black text-zinc-500 uppercase mb-2 tracking-tighter"><span>Espaçamento Entre Passadas</span><span className="text-blue-400 font-mono">{abLine?.spacing} m</span></div>
-                  <input type="range" min="1" max="50" step="0.5" value={abLine?.spacing || 12} onMouseDown={pushToHistory} onChange={(e) => setAbLine(p => p ? { ...p, spacing: Number(e.target.value) } : null)} className="w-full h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-blue-600" />
-                </div>
-              </div>
             </section>
           </div>
         </div>
@@ -503,7 +485,7 @@ const App: React.FC = () => {
           <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.6)]"></div> ISOBUS SYSTEM: ONLINE</span>
           <span className={`flex items-center gap-2 transition-all duration-700 ${isAutoSaving ? 'text-blue-400 opacity-100' : 'text-zinc-800 opacity-50'}`}><CloudUpload size={12} className={isAutoSaving ? 'animate-bounce' : ''} /> {isAutoSaving ? 'SINC. EM NUVEM...' : 'ESTADO SINCRONIZADO'}</span>
         </div>
-        <div className="flex items-center gap-4"><span className="text-zinc-400">AGROVISION OS v2.4.0-PRO • SYSTEM READY</span></div>
+        <div className="flex items-center gap-4"><span className="text-zinc-400 font-bold">AGROVISION OS v2.4.0-PRO</span></div>
       </footer>
     </div>
   );
