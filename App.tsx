@@ -15,13 +15,15 @@ const AUTO_APPLY_AI_KEY = 'agrovision_auto_apply_ai';
 const AUTO_APPLY_SPACING_KEY = 'agrovision_auto_apply_spacing_ai';
 
 /**
- * BASE64 ENCODING & DECODING (MANUAL IMPLEMENTATION)
- * These utilities use native window.atob and window.btoa for cross-browser compatibility
- * and perform manual byte-to-string conversion required for raw PCM audio streaming 
- * with the Gemini Live API, as per @google/genai guidelines.
+ * NATIVE BASE64 ENCODING & DECODING
+ * Utiliza as funções nativas do navegador window.atob e window.btoa.
+ * Estas funções são essenciais para converter strings base64 em buffers de bytes brutos (e vice-versa),
+ * conforme exigido para o streaming de áudio PCM em tempo real da API Gemini Live.
+ * A implementação manual do loop de conversão de caracteres garante que os bytes sejam tratados 
+ * corretamente sem dependências externas, mantendo a performance e conformidade.
  */
 function decode(base64: string): Uint8Array {
-  const binaryString = atob(base64);
+  const binaryString = window.atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
@@ -36,11 +38,11 @@ function encode(bytes: Uint8Array): string {
   for (let i = 0; i < len; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary);
+  return window.btoa(binary);
 }
 
 /**
- * Decodes raw PCM audio data into an AudioBuffer for gapless playback.
+ * Decodifica dados de áudio PCM brutos em um AudioBuffer para reprodução contínua e sem falhas (gapless).
  */
 async function decodeAudioData(
   data: Uint8Array,
